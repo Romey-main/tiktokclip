@@ -257,13 +257,38 @@ def check_caption_template(tpl: str) -> None:
                 + " ".join("{%s}" % x for x in sorted(CAPTION_FIELDS)))
 
 
-def make_caption(tpl: str, title: str, **kw) -> str:
+MAX_TAGS = 4  # #fyp + up to 3 more
+ALWAYS_TAG = "fyp"
+
+
+def build_hashtags(tags: list[str] | None) -> str:
+    """Clean user tags, always include #fyp, cap at MAX_TAGS. Returns '#a #b #fyp'."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in tags or []:
+        for piece in re.split(r"[\s,]+", raw):
+            t = re.sub(r"[^\w]", "", piece.lstrip("#"))
+            if t and t.lower() not in seen and t.lower() != ALWAYS_TAG:
+                seen.add(t.lower())
+                out.append(t)
+    if len(out) > MAX_TAGS - 1:
+        print(f"note: keeping {MAX_TAGS - 1} hashtags + #{ALWAYS_TAG} "
+              f"(dropped: {' '.join('#' + t for t in out[MAX_TAGS - 1:])})", file=sys.stderr)
+        out = out[:MAX_TAGS - 1]
+    out.append(ALWAYS_TAG)
+    return " ".join("#" + t for t in out)
+
+
+def make_caption(tpl: str, title: str, hashtags: str = "", **kw) -> str:
+    # hashtags are never truncated; the title shrinks to make room for them
+    limit = CAPTION_MAX - (len(hashtags) + 1 if hashtags else 0)
     cap = tpl.format(title=title, **kw)
-    if len(cap) > CAPTION_MAX and "{title}" in tpl:
-        room = CAPTION_MAX - len(tpl.format(title="", **kw)) - 1
+    if len(cap) > limit and "{title}" in tpl:
+        room = limit - len(tpl.format(title="", **kw)) - 1
         title = (title[:max(room, 0)].rstrip() + "…") if room > 0 else ""
         cap = tpl.format(title=title, **kw)
-    return cap[:CAPTION_MAX]
+    cap = cap[:limit].rstrip()
+    return f"{cap} {hashtags}".strip() if hashtags else cap
 
 
 # ---------------------------------------------------------------- rendering
@@ -355,6 +380,9 @@ def main(argv: list[str] | None = None) -> int:
                         "crop (fill screen, cut sides), pad (black bars)")
     p.add_argument("--caption", default="{title} - part {n}/{total}",
                    help="caption template; fields: {title} {n} {total} {start} {end}")
+    p.add_argument("--tags", nargs="+", metavar="TAG",
+                   help="up to 3 hashtags added to every caption (#fyp is always added), "
+                        "e.g. --tags trading nasdaq daytrader")
     p.add_argument("--title", help="title used in captions (default: file name)")
     p.add_argument("-o", "--out", default="clips", help="output folder (default: clips)")
     p.add_argument("--dry-run", action="store_true", help="just print the plan")
@@ -393,12 +421,14 @@ def main(argv: list[str] | None = None) -> int:
           f"{output_fps(info['fps']):.3g}fps]")
 
     stem = re.sub(r"[^\w\-]+", "_", title).strip("_")[:50] or "clip"
+    hashtags = build_hashtags(args.tags)
     planned = []
     for i, (s, e) in enumerate(clips, 1):
         name = f"{stem}_{i:03d}_{fmt_time(s).replace(':', '-')}.mp4"
-        caption = make_caption(args.caption, title, n=i, total=total,
+        caption = make_caption(args.caption, title, hashtags, n=i, total=total,
                                start=fmt_time(s), end=fmt_time(e))
         print(f"  [{i}/{total}] {fmt_time(s)} -> {fmt_time(e)}  ({e - s:.1f}s)  {name}")
+        print(f"         caption: {caption}")
         planned.append((i, s, e, name, caption))
     if args.dry_run:
         return 0

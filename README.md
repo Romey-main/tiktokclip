@@ -34,6 +34,7 @@ Options:
 - `--format blur` (default): shows the full frame over a blurred copy of itself. Good for gameplay, charts and screen recordings.
 - `--format crop`: fills the screen and cuts off the sides. Good when the action is in the middle.
 - `--format pad`: shows the full frame with black bars.
+- `--tags trading nasdaq daytrader`: up to 3 hashtags added to every caption. `#fyp` is always added, so the default caption looks like `My stream - part 1/5 #trading #nasdaq #daytrader #fyp`. If a long title would push the caption past 150 characters, the title gets shortened and the hashtags are kept.
 - `--caption "{title} pt {n}"`: caption template. The fields are `{title} {n} {total} {start} {end}`.
 - `--title "My stream"`: title used in captions. Defaults to the file name.
 - `-o folder`: where the clips go. Defaults to `clips/`.
