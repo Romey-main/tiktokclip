@@ -1,0 +1,5 @@
+clips/
+*.mp4
+*.webm
+*.mov
+__pycache__/
