@@ -18,7 +18,9 @@ Claude cuts the clips, uploads each one, and opens a TikTok publish form for eve
 
 ## Running it yourself
 
-Needs Python 3.9+, ffmpeg, and `pip install yt-dlp` if you want to use links.
+Needs Python 3.9+, ffmpeg, and `pip install yt-dlp` if you want to use links. On Windows, type `python` instead of `python3`. If ffmpeg is missing, run `winget install Gyan.FFmpeg` and then open a new terminal.
+
+With a link, only the part you're clipping gets downloaded, not the whole video.
 
 ```bash
 python3 tikclip.py video.mp4 --at 1:23 --length 30

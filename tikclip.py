@@ -27,6 +27,7 @@ import argparse
 import json
 import math
 import re
+import importlib.util
 import shutil
 import string
 import subprocess
@@ -86,7 +87,8 @@ def fmt_time(s: float) -> str:
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True)
+    # explicit UTF-8: on Windows the default code page can't decode every byte
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
 def ff_path(p: Path) -> str:
@@ -167,23 +169,60 @@ def output_fps(fps: float) -> float:
     return min(STD_RATES, key=lambda r: abs(r - min(fps, 60.0)))
 
 
-def download(url: str, workdir: Path) -> Path:
-    if shutil.which("yt-dlp") is None:
-        die("yt-dlp is not installed (pip install yt-dlp)")
+def ytdlp_cmd() -> list[str]:
+    exe = shutil.which("yt-dlp")
+    if exe:
+        return [exe]
+    if importlib.util.find_spec("yt_dlp") is not None:
+        # pip on Windows often installs yt-dlp.exe into a folder that isn't on PATH
+        return [sys.executable, "-m", "yt_dlp"]
+    die("yt-dlp is not installed (pip install yt-dlp)")
+
+
+def download(url: str, workdir: Path, section: tuple[float, float] | None = None) -> Path:
+    """Download a video. With `section`, only that time range is fetched."""
     workdir.mkdir(parents=True, exist_ok=True)
-    tmpl = str(workdir / "%(title).80B [%(id)s].%(ext)s")
-    print(f"downloading {url} ...")
-    r = subprocess.run(["yt-dlp", "--no-playlist", "-f",
-                        "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b",
-                        "--merge-output-format", "mp4", "-o", tmpl,
-                        "--print", "after_move:filepath", url],
-                       capture_output=True, text=True)
+    tag = f" {section[0]:g}-{section[1]:g}" if section else ""
+    tmpl = str(workdir / f"%(title).80B [%(id)s]{tag}.%(ext)s")
+    cmd = ytdlp_cmd() + ["--no-playlist", "--encoding", "utf-8", "-f",
+                         "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b",
+                         "--merge-output-format", "mp4", "-o", tmpl,
+                         "--print", "after_move:filepath"]
+    if shutil.which("node"):
+        cmd += ["--js-runtimes", "node"]  # YouTube needs a JS runtime; deno is used if present
+    if section:
+        # exact cut points (re-encodes only the edges), so clip times line up
+        cmd += ["--download-sections", f"*{section[0]:.3f}-{section[1]:.3f}",
+                "--force-keyframes-at-cuts"]
+        print(f"downloading {fmt_time(section[0])}-{fmt_time(section[1])} of {url} ...")
+    else:
+        print(f"downloading {url} ...")
+    r = subprocess.run(cmd + [url], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
     if r.returncode != 0:
         die(f"download failed:\n{r.stderr.strip()[-1500:]}")
-    path = Path(r.stdout.strip().splitlines()[-1])
-    if not path.exists():
+    lines = r.stdout.strip().splitlines()
+    path = Path(lines[-1]) if lines else None
+    if path is None or not path.exists():
         die(f"download finished but file not found: {path}")
     return path
+
+
+def download_section(args) -> tuple[float, float] | None:
+    """The part of the video the requested clips need, or None for the whole thing."""
+    if args.every is None and args.at:
+        lo = min(args.at)
+        if args.end is not None:
+            hi = args.end
+        elif args.length is not None:
+            hi = max(args.at) + args.length
+        else:
+            return None  # "--at T" alone runs to the end of the video
+    elif args.every is not None and args.to is not None:
+        lo, hi = (args.from_ or 0.0), args.to
+    else:
+        return None
+    return (lo, hi) if hi > lo else None
 
 
 # ---------------------------------------------------------------- planning
@@ -348,7 +387,7 @@ def render(src: Path, info: dict, start: float, end: float, out: Path, mode: str
 def load_manifest(path: Path) -> dict:
     if path.exists():
         try:
-            m = json.loads(path.read_text())
+            m = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(m.get("clips"), list):
                 return m
         except (json.JSONDecodeError, AttributeError):
@@ -387,6 +426,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-o", "--out", default="clips", help="output folder (default: clips)")
     p.add_argument("--dry-run", action="store_true", help="just print the plan")
     args = p.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):  # odd characters in titles must not crash Windows consoles
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
     for tool in ("ffmpeg", "ffprobe"):
         if shutil.which(tool) is None:
@@ -397,11 +441,27 @@ def main(argv: list[str] | None = None) -> int:
         die("use either --length or --end, not both")
     if (args.from_ is not None or args.to is not None) and args.every is None:
         die("--from/--to only apply to --every (use --at/--end for single clips)")
+    if args.end is not None and args.at and len(args.at) == 1 and args.end <= args.at[0]:
+        die(f"end {fmt_time(args.end)} is not after start {fmt_time(args.at[0])}")
+    if args.every is not None and args.to is not None and args.to <= (args.from_ or 0.0):
+        die(f"--to {fmt_time(args.to)} must be after --from {fmt_time(args.from_ or 0.0)}")
     check_caption_template(args.caption)
 
     out_dir = Path(args.out)
+    offset = 0.0  # where the downloaded file starts in the original video
     if re.match(r"^https?://", args.source):
-        src = download(args.source, out_dir / "_downloads")
+        section = download_section(args)
+        src = download(args.source, out_dir / "_downloads", section)
+        if section:
+            offset = section[0]
+            if args.at:
+                args.at = [a - offset for a in args.at]
+            if args.end is not None:
+                args.end -= offset
+            if args.from_ is not None:
+                args.from_ -= offset
+            if args.to is not None:
+                args.to -= offset
     else:
         src = Path(args.source).expanduser()
         if not src.is_file():
@@ -409,9 +469,10 @@ def main(argv: list[str] | None = None) -> int:
 
     info = probe(src)
     if info["duration"] <= 0:
-        die("couldn't determine the video length")
+        die("couldn't determine the video length" +
+            (f" - is {fmt_time(offset)} past the end of the video?" if offset else ""))
     clips = plan_clips(args, info["duration"])
-    title = args.title or re.sub(r"\s*\[[^\]]+\]$", "", src.stem)
+    title = args.title or re.sub(r"\s*\[[^\]]+\].*$", "", src.stem) or src.stem
     total = len(clips)
 
     print(f"source: {src.name}  ({fmt_time(info['duration'])}, "
@@ -424,10 +485,12 @@ def main(argv: list[str] | None = None) -> int:
     hashtags = build_hashtags(args.tags)
     planned = []
     for i, (s, e) in enumerate(clips, 1):
-        name = f"{stem}_{i:03d}_{fmt_time(s).replace(':', '-')}.mp4"
+        # names, captions and printed times use the ORIGINAL video's timeline
+        os_, oe = s + offset, e + offset
+        name = f"{stem}_{i:03d}_{fmt_time(os_).replace(':', '-')}.mp4"
         caption = make_caption(args.caption, title, hashtags, n=i, total=total,
-                               start=fmt_time(s), end=fmt_time(e))
-        print(f"  [{i}/{total}] {fmt_time(s)} -> {fmt_time(e)}  ({e - s:.1f}s)  {name}")
+                               start=fmt_time(os_), end=fmt_time(oe))
+        print(f"  [{i}/{total}] {fmt_time(os_)} -> {fmt_time(oe)}  ({e - s:.1f}s)  {name}")
         print(f"         caption: {caption}")
         planned.append((i, s, e, name, caption))
     if args.dry_run:
@@ -442,14 +505,15 @@ def main(argv: list[str] | None = None) -> int:
         prev = by_file.get(name, {})
         entry = {"n": i, "file": name, "path": str((out_dir / name).resolve()),
                  "source": str(src.resolve()), "title": title, "format": args.format,
-                 "start": s, "end": e, "seconds": round(e - s, 3), "caption": caption,
+                 "start": round(s + offset, 3), "end": round(e + offset, 3),
+                 "seconds": round(e - s, 3), "caption": caption,
                  "posted": bool(prev.get("posted", False))}
         if name in by_file:
             manifest["clips"][manifest["clips"].index(prev)] = entry
         else:
             manifest["clips"].append(entry)
         by_file[name] = entry
-        mpath.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
+        mpath.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"done. manifest: {mpath}")
     return 0
 
