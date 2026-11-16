@@ -10,7 +10,7 @@ The user pastes a link. Find the best moments or use the time range they gave. C
 ## Tools this needs
 
 - **Desktop Commander** (`start_process`, `read_file`): runs commands on the user's Windows PC. YouTube blocks cloud servers, so downloads must run on the PC.
-- **HiggsField connector**: `media_upload`, `media_confirm`, `tiktok_accounts`, `tiktok_prepare_publish`, `tiktok_publish_status`.
+- **HiggsField connector**: `media_upload`, `media_confirm`, `tiktok_accounts`, `tiktok_connect`, `tiktok_reconnect`, `tiktok_prepare_publish`, `tiktok_publish_status`.
 - **tikclip.py**: the clipper, at `%USERPROFILE%\tiktokclip\tikclip.py`. Source: https://github.com/Romey-main/tiktokclip
 
 If Desktop Commander or HiggsField is missing, say which one and stop. Don't try to work around it.
@@ -20,7 +20,7 @@ If Desktop Commander or HiggsField is missing, say which one and stop. Don't try
 - Post straight to the profile: `mode: DIRECT_POST`.
 - Public: `privacy_level: PUBLIC_TO_EVERYONE`.
 - Caption: a short title that matches what is said in the clip, then 3 relevant hashtags, then `#fyp`. Example: `Dana White on taking risks #CEO #UFC #Dana #fyp`. The caption must be 150 characters or less (tikclip enforces this).
-- If the user names hashtags, use theirs. #fyp is always added.
+- If the user names hashtags, use theirs. #fyp is always added. tikclip keeps at most 3 hashtags plus #fyp, so if the user names more than 3, ask which 3 to keep.
 
 ## Running commands on the PC
 
@@ -29,20 +29,26 @@ If Desktop Commander or HiggsField is missing, say which one and stop. Don't try
 - Always use absolute paths. Output folder: `%USERPROFILE%\tiktok-clips` (in PowerShell: `$HOME\tiktok-clips`).
 - Before the first command of a session, update the tool: `git -C "$HOME\tiktokclip" pull`. If the folder doesn't exist, run `git clone https://github.com/Romey-main/tiktokclip "$HOME\tiktokclip"`.
 - Downloads can take a minute or two. Wait for the process to finish and read its full output.
+- **Quote any text you write into a command in single quotes**: titles, captions and URLs. Inside double quotes PowerShell expands `$` (so "How he made $100" turns into "How he made "), and straight `"` characters break arguments. Write an apostrophe inside single quotes as two apostrophes: `--title 'Dana''s $100 bet'`. Don't use straight double quotes in titles; use “curly quotes” instead.
+- After cutting, compare the `caption:` line tikclip prints with the caption you intended. If they differ, fix the command and cut again before uploading.
 
 ## Workflow
 
 ### 1. The user pastes a link
 
-**If they gave a time range** (e.g. "1:10:50 to 1:12:28"), go straight to step 3.
-
-**Otherwise, find the best moments:**
+Always start by reading the video. This doesn't download it, it only fetches the info and captions, so it's quick:
 
 ```
-python "$HOME\tiktokclip\tikclip.py" suggest "<URL>" -o "$HOME\tiktok-clips"
+python "$HOME\tiktokclip\tikclip.py" suggest '<URL>' -o "$HOME\tiktok-clips"
 ```
 
-This prints the title, length, YouTube's "most replayed" peaks with what is said in each, and the chapters. It also writes `transcript.txt`, a timestamped transcript, in the output folder. Read the transcript with `read_file`. For long videos, read the parts around each peak, or skim the whole thing if there are no peaks.
+This prints the title, length, YouTube's "most replayed" peaks with what is said in each, and the chapters. It also writes `transcript.txt`, a timestamped transcript, in the output folder. Read it with `read_file`.
+
+`transcript.txt` has one timestamp roughly every 15 seconds. When you need an exact sentence start, read the caption file in `$HOME\tiktok-clips\_suggest\` (`video.<lang>.json3`: `events[].tStartMs` plus `segs[].utf8`, or a `.vtt`). Otherwise start a second or two early so the first word isn't cut off.
+
+**If the user gave a time range** (e.g. "1:10:50 to 1:12:28"), read the transcript lines inside that range so the title matches what's said. If there are no captions, ask what the clip is about. Then go to step 3.
+
+**Otherwise,** use the peaks and the transcript to offer options (step 2). For long videos, read the parts around each peak, or skim the whole thing if there are no peaks.
 
 ### 2. Offer 3-5 options
 
@@ -69,11 +75,11 @@ Ask which one(s) to post. The user can pick several, change a title, or give the
 For one clip:
 
 ```
-python "$HOME\tiktokclip\tikclip.py" "<URL>" --at <START> --end <END> --title "<TITLE>" --tags <TAG1> <TAG2> <TAG3> --caption "{title}" -o "$HOME\tiktok-clips"
+python "$HOME\tiktokclip\tikclip.py" '<URL>' --at <START> --end <END> --title '<TITLE>' --tags <TAG1> <TAG2> <TAG3> --caption '{title}' -o "$HOME\tiktok-clips"
 ```
 
 - Pass tags without `#`. #fyp is added automatically.
-- `--caption "{title}"` leaves out "part 1/1" for a single clip. Leave `--caption` off for a series (`--every N`), so each one gets "part 2/5" and so on.
+- `--caption '{title}'` leaves out "part 1/1" for a single clip. Leave `--caption` off for a series (`--every N`), so each one gets "part 2/5" and so on.
 - For several picks, run the command once per pick. Each one downloads only its own section.
 - The output prints the clip's file name and its `caption:` line. `manifest.json` in the output folder has `path` and `caption` for every clip.
 
@@ -84,12 +90,15 @@ python "$HOME\tiktokclip\tikclip.py" "<URL>" --at <START> --end <END> --title "<
    ```
    python "$HOME\tiktokclip\tikclip.py" put "<CLIP PATH>" '<UPLOAD_URL>'
    ```
-   It must print `HTTP 200`.
+   It must print `HTTP 200`. If it fails with `HTTP 412`, the file is already uploaded (an earlier try worked), so go on to `media_confirm`.
 3. Call `media_confirm` with `media_id` and `type: "video"`. Use the confirmed `url` in the next step.
 
 ### 5. Open the TikTok post form
 
-1. Call `tiktok_accounts` and use the `connector_id` of the account whose status is `active`. If there isn't one, call `tiktok_connect` and give the user the link.
+1. Call `tiktok_accounts` and use the `connector_id` of the account whose status is `active`.
+   - If an account has status `error`, call `tiktok_reconnect` and give the user the link.
+   - If there are no accounts, call `tiktok_connect` and give the user the link.
+   - The link expires in about 10 minutes. Once the user has approved it, call `tiktok_accounts` again and check the account is `active`.
 2. Call `tiktok_prepare_publish` with:
    - `connector_id`
    - `mode: "DIRECT_POST"`, `media_type: "VIDEO"`

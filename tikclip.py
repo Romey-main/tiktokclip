@@ -432,11 +432,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-o", "--out", default="clips", help="output folder (default: clips)")
     p.add_argument("--dry-run", action="store_true", help="just print the plan")
     args = p.parse_args(argv)
-    for stream in (sys.stdout, sys.stderr):  # odd characters in titles must not crash Windows consoles
-        try:
-            stream.reconfigure(errors="replace")
-        except (AttributeError, ValueError):
-            pass
 
     for tool in ("ffmpeg", "ffprobe"):
         if shutil.which(tool) is None:
@@ -534,7 +529,7 @@ def fetch_info_and_captions(url: str, workdir: Path) -> tuple[dict, Path | None]
     cmd = ytdlp_cmd() + ["--no-playlist", "--encoding", "utf-8", "--skip-download",
                          "--ignore-errors", "--write-info-json", "--write-subs",
                          "--write-auto-subs", "--sub-langs", "en.*,en", "--sub-format",
-                         "json3", "-o", str(workdir / "video.%(ext)s")]
+                         "json3/vtt", "-o", str(workdir / "video.%(ext)s")]
     if shutil.which("node"):
         cmd += ["--js-runtimes", "node"]
     print(f"reading {url} ...", file=sys.stderr)
@@ -544,10 +539,43 @@ def fetch_info_and_captions(url: str, workdir: Path) -> tuple[dict, Path | None]
     if not info_path.exists():
         die(f"couldn't read the video info:\n{r.stderr.strip()[-1500:]}")
     info = json.loads(info_path.read_text(encoding="utf-8"))
-    subs = sorted(workdir.glob("video.*.json3"))
-    # prefer human captions ("en") over auto ones ("en-orig", "en-en", ...)
-    subs.sort(key=lambda p: (p.name != "video.en.json3", p.name))
+    subs = [p for p in workdir.glob("video.*") if p.suffix in (".json3", ".vtt")]
+    manual = set((info.get("subtitles") or {}).keys())  # human-made tracks
+
+    def rank(p: Path) -> tuple:
+        lang = p.name[len("video."):-len(p.suffix)]
+        return (lang not in manual,          # human captions first
+                lang != "en",                # then plain English auto captions
+                lang != "en-orig",
+                p.suffix != ".json3", p.name)
+    subs.sort(key=rank)
     return info, (subs[0] if subs else None)
+
+
+def parse_vtt(path: Path) -> list[tuple[float, str]]:
+    """WebVTT captions -> [(start_seconds, text)]."""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out = []
+    for block in re.split(r"\n\s*\n", raw.replace("\r", "")):
+        lines = block.strip().split("\n")
+        for i, line in enumerate(lines):
+            m = re.match(r"(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{3})\s+-->", line)
+            if m:
+                h, mi, s, ms = (int(g) if g else 0 for g in m.groups())
+                text = " ".join(re.sub(r"<[^>]+>", "", t) for t in lines[i + 1:]).strip()
+                if text:
+                    out.append((h * 3600 + mi * 60 + s + ms / 1000, re.sub(r"\s+", " ", text)))
+                break
+    return out
+
+
+def parse_captions(path: Path | None) -> list[tuple[float, str]]:
+    if path is None:
+        return []
+    return parse_vtt(path) if path.suffix == ".vtt" else parse_json3(path)
 
 
 def parse_json3(path: Path) -> list[tuple[float, str]]:
@@ -619,7 +647,11 @@ def pick_moments(heat: list[float], duration: float, count: int, length: float,
     median, peak = ordered[len(ordered) // 2], ordered[-1]
     if peak - median < 0.1:
         return []  # flat replay graph: nothing stands out
-    floor = median + 0.25 * (peak - median)  # must stand out from the video's normal level
+    # a window must stand out from the OTHER windows (judging against single seconds
+    # would average away a short, sharp spike)
+    wscores = sorted(sc for sc, _ in scores)
+    w_median, w_peak = wscores[len(wscores) // 2], wscores[-1]
+    floor = w_median + 0.25 * (w_peak - w_median)
 
     def same_hill(a: int, b: int, score_a: float, score_b: float) -> bool:
         """True if the replay graph never dips between two windows (one peak, not two)."""
@@ -682,12 +714,12 @@ def suggest_main(argv: list[str]) -> int:
     duration = float(info.get("duration") or 0)
     if duration <= 0:
         die("couldn't determine the video length")
-    lines = parse_json3(subs_path) if subs_path else []
+    lines = parse_captions(subs_path)
     heatmap = info.get("heatmap") or []
 
     # the start of a video always looks "replayed" (everyone watches it): skip it
     first_seg_end = min((float(h.get("end_time", 0)) for h in heatmap), default=0.0)
-    skip_intro = max(30.0, first_seg_end) if duration > 300 else 0.0
+    skip_intro = max(first_seg_end, min(30.0, 0.1 * duration))
     moments = []
     if heatmap:
         for s, e, score in pick_moments(heat_per_second(heatmap, duration), duration,
@@ -768,7 +800,18 @@ def put_main(argv: list[str]) -> int:
     return 1
 
 
+def safe_output() -> None:
+    """UTF-8 output that never crashes. On Windows a piped stdout (Git Bash, Desktop
+    Commander) defaults to the ANSI code page and dies on emoji in video titles."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 if __name__ == "__main__":
+    safe_output()
     if len(sys.argv) > 1 and sys.argv[1] == "suggest":
         sys.exit(suggest_main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "put":
