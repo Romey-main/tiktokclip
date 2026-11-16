@@ -17,6 +17,12 @@ Examples
   # works on links too (YouTube, Twitch VODs, X, etc. via yt-dlp)
   tikclip.py "https://youtube.com/watch?v=..." --every 45
 
+  # find the best moments (YouTube 'most replayed' + transcript)
+  tikclip.py suggest "https://youtube.com/watch?v=..."
+
+  # upload a clip to a presigned URL (HiggsField media_upload)
+  tikclip.py put clips/my_clip.mp4 "https://upload.higgsfield.ai/..."
+
 Every clip is exported as a TikTok-compliant MP4 (H.264/AAC, 1080x1920,
 24-60 fps, 3-600 s). A manifest.json is kept in the output folder with a
 suggested caption and a "posted" flag per clip.
@@ -518,5 +524,253 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- suggest
+def fetch_info_and_captions(url: str, workdir: Path) -> tuple[dict, Path | None]:
+    """Metadata (incl. YouTube 'most replayed' heatmap) + captions, without the video."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    for old in workdir.glob("*"):
+        if old.is_file():
+            old.unlink()
+    cmd = ytdlp_cmd() + ["--no-playlist", "--encoding", "utf-8", "--skip-download",
+                         "--ignore-errors", "--write-info-json", "--write-subs",
+                         "--write-auto-subs", "--sub-langs", "en.*,en", "--sub-format",
+                         "json3", "-o", str(workdir / "video.%(ext)s")]
+    if shutil.which("node"):
+        cmd += ["--js-runtimes", "node"]
+    print(f"reading {url} ...", file=sys.stderr)
+    r = subprocess.run(cmd + [url], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    info_path = workdir / "video.info.json"
+    if not info_path.exists():
+        die(f"couldn't read the video info:\n{r.stderr.strip()[-1500:]}")
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    subs = sorted(workdir.glob("video.*.json3"))
+    # prefer human captions ("en") over auto ones ("en-orig", "en-en", ...)
+    subs.sort(key=lambda p: (p.name != "video.en.json3", p.name))
+    return info, (subs[0] if subs else None)
+
+
+def parse_json3(path: Path) -> list[tuple[float, str]]:
+    """YouTube json3 captions -> [(start_seconds, text)]."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    out = []
+    for ev in data.get("events", []):
+        segs = ev.get("segs")
+        if not segs:
+            continue
+        text = "".join(s.get("utf8", "") for s in segs).replace("\n", " ").strip()
+        if text:
+            out.append((ev.get("tStartMs", 0) / 1000.0, re.sub(r"\s+", " ", text)))
+    return out
+
+
+def transcript_blocks(lines: list[tuple[float, str]], block_s: float = 15.0) -> list[tuple[float, str]]:
+    """Merge caption lines into ~15 s blocks so a long video stays readable."""
+    blocks: list[tuple[float, str]] = []
+    cur_start, cur = None, []
+    for t, text in lines:
+        if cur_start is None:
+            cur_start = t
+        if t - cur_start >= block_s and cur:
+            blocks.append((cur_start, " ".join(cur)))
+            cur_start, cur = t, []
+        if not cur or cur[-1] != text:  # auto captions repeat lines
+            cur.append(text)
+    if cur:
+        blocks.append((cur_start, " ".join(cur)))
+    return blocks
+
+
+def text_between(lines: list[tuple[float, str]], s: float, e: float, limit: int = 280) -> str:
+    words = " ".join(t for ts, t in lines if s <= ts < e)
+    return words if len(words) <= limit else words[:limit].rsplit(" ", 1)[0] + " …"
+
+
+def heat_per_second(heatmap: list[dict], duration: float) -> list[float]:
+    n = int(math.ceil(duration))
+    heat = [0.0] * max(n, 1)
+    for seg in heatmap or []:
+        try:
+            a, b, v = float(seg["start_time"]), float(seg["end_time"]), float(seg["value"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        for i in range(max(0, int(a)), min(n, int(math.ceil(b)))):
+            heat[i] = max(heat[i], v)
+    return heat
+
+
+def pick_moments(heat: list[float], duration: float, count: int, length: float,
+                 skip_intro: float) -> list[tuple[float, float, float]]:
+    """Greedy: the `count` non-overlapping windows with the highest average replay heat."""
+    L = max(1, int(round(length)))
+    n = len(heat)
+    if n <= L:
+        return [(0.0, duration, sum(heat) / max(n, 1))]
+    prefix = [0.0]
+    for h in heat:
+        prefix.append(prefix[-1] + h)
+    scores = [((prefix[s + L] - prefix[s]) / L, s) for s in range(int(skip_intro), n - L + 1)]
+    if not scores:
+        return []
+    ordered = sorted(heat[int(skip_intro):])
+    median, peak = ordered[len(ordered) // 2], ordered[-1]
+    if peak - median < 0.1:
+        return []  # flat replay graph: nothing stands out
+    floor = median + 0.25 * (peak - median)  # must stand out from the video's normal level
+
+    def same_hill(a: int, b: int, score_a: float, score_b: float) -> bool:
+        """True if the replay graph never dips between two windows (one peak, not two)."""
+        def top(s: int) -> int:  # where the window's replay graph is highest
+            seg = heat[s:s + L]
+            return s + max(range(len(seg)), key=seg.__getitem__)
+        lo, hi = sorted((top(a), top(b)))
+        dip = min(heat[lo:hi + 1]) if hi > lo else peak
+        return dip >= floor and dip >= 0.7 * min(score_a, score_b)
+
+    scores.sort(reverse=True)
+    chosen: list[tuple[float, float, float]] = []
+    for score, s in scores:
+        if score <= 0 or score < floor or len(chosen) >= count:
+            break
+        # one pick per replay peak
+        if all(abs(s - a) >= 1.5 * L and not same_hill(s, int(a), score, sa)
+               for a, _, sa in chosen):
+            chosen.append((float(s), float(min(s + L, duration)), score))
+    return sorted(chosen, key=lambda c: -c[2])
+
+
+def snap_to_captions(s: float, e: float, lines: list[tuple[float, str]],
+                     min_len: float, max_len: float, duration: float) -> tuple[float, float]:
+    """Start on a caption boundary just before s, end on one just after e."""
+    starts = [t for t, _ in lines]
+    if starts:
+        before = [t for t in starts if t <= s + 0.5]
+        if before and s - before[-1] <= 4:
+            s = before[-1]
+        after = [t for t in starts if t >= e - 0.5]
+        if after and after[0] - e <= 4:
+            e = after[0]
+    e = min(max(e, s + min_len), s + max_len, duration)
+    return round(max(s, 0.0), 1), round(e, 1)
+
+
+def suggest_main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(
+        prog="tikclip.py suggest",
+        description="Find the best moments of a video to clip: YouTube's 'most replayed' "
+                    "peaks plus a timestamped transcript.")
+    p.add_argument("url")
+    p.add_argument("--count", type=int, default=5, help="how many moments to suggest (default 5)")
+    p.add_argument("--length", type=positive_seconds, default=45,
+                   help="target clip length in seconds (default 45)")
+    p.add_argument("--min", dest="min_len", type=positive_seconds, default=15)
+    p.add_argument("--max", dest="max_len", type=positive_seconds, default=90)
+    p.add_argument("-o", "--out", default="clips", help="output folder (default: clips)")
+    args = p.parse_args(argv)
+    if args.count < 1:
+        die("--count must be at least 1")
+    if not args.min_len <= args.length <= args.max_len:
+        die("--length must be between --min and --max")
+    if not re.match(r"^https?://", args.url):
+        die("suggest needs a video link")
+
+    work = Path(args.out) / "_suggest"
+    info, subs_path = fetch_info_and_captions(args.url, work)
+    duration = float(info.get("duration") or 0)
+    if duration <= 0:
+        die("couldn't determine the video length")
+    lines = parse_json3(subs_path) if subs_path else []
+    heatmap = info.get("heatmap") or []
+
+    # the start of a video always looks "replayed" (everyone watches it): skip it
+    first_seg_end = min((float(h.get("end_time", 0)) for h in heatmap), default=0.0)
+    skip_intro = max(30.0, first_seg_end) if duration > 300 else 0.0
+    moments = []
+    if heatmap:
+        for s, e, score in pick_moments(heat_per_second(heatmap, duration), duration,
+                                        args.count, args.length, skip_intro):
+            s, e = snap_to_captions(s, e, lines, args.min_len, args.max_len, duration)
+            if e - s >= TIKTOK_MIN_S:
+                moments.append({"start": s, "end": e, "start_hms": fmt_time(s),
+                                "end_hms": fmt_time(e), "seconds": round(e - s, 1),
+                                "replay_score": round(score, 3),
+                                "says": text_between(lines, s, e)})
+
+    blocks = transcript_blocks(lines)
+    tpath = Path(args.out) / "transcript.txt"
+    tpath.parent.mkdir(parents=True, exist_ok=True)
+    tpath.write_text("\n".join(f"[{fmt_time(t)}] {txt}" for t, txt in blocks) + "\n",
+                     encoding="utf-8")
+    chapters = [{"start_hms": fmt_time(float(c.get("start_time", 0))), "title": c.get("title", "")}
+                for c in info.get("chapters") or []]
+    result = {"url": info.get("webpage_url") or args.url, "title": info.get("title"),
+              "channel": info.get("channel") or info.get("uploader"),
+              "duration": duration, "duration_hms": fmt_time(duration),
+              "has_replay_data": bool(heatmap), "has_transcript": bool(lines),
+              "moments": moments, "chapters": chapters, "transcript_file": str(tpath.resolve())}
+    (Path(args.out) / "suggest.json").write_text(json.dumps(result, indent=2, ensure_ascii=False),
+                                                 encoding="utf-8")
+
+    print(f"title:    {result['title']}")
+    print(f"channel:  {result['channel']}")
+    print(f"length:   {result['duration_hms']}")
+    if moments:
+        print("\nmost replayed moments (best first):")
+        for i, m in enumerate(moments, 1):
+            print(f"  {i}. {m['start_hms']} -> {m['end_hms']}  ({m['seconds']:.0f}s, "
+                  f"replay {m['replay_score']:.2f})")
+            if m["says"]:
+                print(f"     \"{m['says']}\"")
+    elif heatmap:
+        print("\nreplay data shows no stand-out moments - pick moments from the transcript")
+    else:
+        print("\nno 'most replayed' data for this video - pick moments from the transcript")
+    if chapters:
+        print("\nchapters:")
+        for c in chapters:
+            print(f"  {c['start_hms']}  {c['title']}")
+    print(f"\ntranscript: {tpath.resolve()}" if lines else "\nno captions available")
+    print(f"details:    {(Path(args.out) / 'suggest.json').resolve()}")
+    return 0
+
+
+# ---------------------------------------------------------------- put
+def put_main(argv: list[str]) -> int:
+    """Upload a file to a presigned URL (e.g. from HiggsField media_upload)."""
+    import urllib.error
+    import urllib.request
+    p = argparse.ArgumentParser(prog="tikclip.py put",
+                                description="Upload a clip to a presigned upload URL.")
+    p.add_argument("file")
+    p.add_argument("url", help="the upload_url (put it in quotes)")
+    p.add_argument("--content-type", default="video/mp4")
+    args = p.parse_args(argv)
+    path = Path(args.file).expanduser()
+    if not path.is_file():
+        die(f"file not found: {path}")
+    size = path.stat().st_size
+    with path.open("rb") as fh:
+        req = urllib.request.Request(args.url, data=fh, method="PUT", headers={
+            "Content-Type": args.content_type, "Content-Length": str(size),
+            "If-None-Match": "*"})
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                print(f"HTTP {resp.status} - uploaded {path.name} ({size / 1e6:.1f} MB)")
+                return 0
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")[:500]
+            die(f"upload failed: HTTP {exc.code}\n{body}")
+        except urllib.error.URLError as exc:
+            die(f"upload failed: {exc.reason}")
+    return 1
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "suggest":
+        sys.exit(suggest_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "put":
+        sys.exit(put_main(sys.argv[2:]))
     sys.exit(main())
